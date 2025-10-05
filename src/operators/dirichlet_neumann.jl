@@ -1,115 +1,107 @@
+module DirichletNeumann
+
+using LinearAlgebra
 using SpecialFunctions
 
+export DirichletToNeumannOperator, build_D2N, apply_D2N, as_matrix
+
 """
-Dirichlet-to-Neumann operator using Chebyshev spectral collocation
+Bessel-basis Galerkin D2N (axisymmetric, φ(R)=0).
+
+기저   : J0(ζ_n r / R), ζ_n = n번째 J0 영점
+계수   : a = G^{-1} Bᵀ W φ,  (G = Bᵀ W B : 이산 Gram)
+사상   : Nφ = - B ∘(k)∘ a,   (k_n = ζ_n / R, ∘(k)∘ = Diag(k))
+여기서
+- B[i,n] = J0(ζ_n r_i / R)
+- W = diag(w_i), w_i = r_i Δr (끝점 1/2; 축대칭 정규화에 맞춤)
+
+※ 구현 포인트:
+- G를 팩터(F)로 저장하고, apply할 때마다 a를 푼다(F rhs).
+- 필요 시에만 아주 작은 ridge λI를 자동 주입해 수치안정 보장.
 """
 struct DirichletToNeumannOperator
-    radial_mesh::RadialMesh
-    operator_matrix::SparseMatrixCSC{Float64, Int}
-    cheb_points::Vector{Float64}
+    # 저장: 행렬 N 자체가 아니라, 적용에 필요한 요소들
+    B::Matrix{Float64}                        # nr × Nm
+    W::Diagonal{Float64,Vector{Float64}}      # nr × nr
+    k::Vector{Float64}                        # Nm
+    F::Factorization{Float64}                 # G(=B'WB)의 안정화된 팩터(cholesky 또는 ldlt)
+    zeta::Vector{Float64}                     # Nm
+    R::Float64
+    r::Vector{Float64}
 end
 
-"""
-Chebyshev collocation points in [0, R]
-"""
-function chebyshev_points(n::Int, R::Float64)
-    # Gauss-Lobatto points: x_j = cos(jπ/n), j=0,...,n
-    # Map from [-1,1] to [0,R]
-    θ = [j*π/n for j in 0:n]
-    x = cos.(θ)  # x ∈ [-1, 1]
-    r = R * (1 .+ x) ./ 2  # r ∈ [0, R]
-    return r
+"J0 영점: McMahon 초기값 + Newton 보정(J0'=-J1)."
+function _j0_zeros(N::Int)
+    z = Vector{Float64}(undef, N)
+    @inbounds for n in 1:N
+        x = (n - 0.25)*π
+        for _ in 1:20
+            f  = besselj(0, x)
+            fp = -besselj(1, x)
+            x -= f / fp
+        end
+        z[n] = x
+    end
+    return z
 end
 
-"""
-Chebyshev differentiation matrix
-"""
-function chebyshev_diff_matrix(n::Int)
-    # First derivative matrix for Chebyshev points
-    θ = [j*π/n for j in 0:n]
-    x = cos.(θ)
-    
-    D = zeros(n+1, n+1)
-    
-    for i in 0:n
-        for j in 0:n
-            if i == j
-                if i == 0
-                    D[i+1, j+1] = (2n^2 + 1) / 6
-                elseif i == n
-                    D[i+1, j+1] = -(2n^2 + 1) / 6
-                else
-                    D[i+1, j+1] = -x[i+1] / (2(1 - x[i+1]^2))
-                end
-            else
-                c_i = (i == 0 || i == n) ? 2 : 1
-                c_j = (j == 0 || j == n) ? 2 : 1
-                D[i+1, j+1] = (c_i/c_j) * (-1)^(i+j) / (x[i+1] - x[j+1])
-            end
+"Gram이 SPD처럼 보이지 않으면 작은 λI로 ridge를 주입해 factorization."
+function _factor_with_ridge(G::Symmetric{Float64,Matrix{Float64}})
+    s = maximum(abs, diag(G))
+    λ = (s == 0.0) ? 1e-14 : 1e-14*s
+    for _ in 1:6
+        try
+            return cholesky(G + λ*I)
+        catch
+            λ *= 100.0
         end
     end
-    
-    return D
+    # 마지막 안전장치
+    return ldlt(G + λ*I)
 end
 
-"""
-Build N operator with Chebyshev method
-Simpler approximation: N ≈ -√Δ in Fourier space
-For Chebyshev, use local wavenumber estimate
-"""
-function build_N_chebyshev(mesh::RadialMesh)
-    nr = mesh.nr
-    r = mesh.r
-    δr = mesh.δr
-    
-    rows = Int[]
-    cols = Int[]
-    vals = Float64[]
-    
-    # Use derivative-based approximation with Chebyshev smoothness
-    # N[φ] ≈ -k_eff * φ where k_eff varies smoothly
-    
-    for i in 1:nr
-        if i == 1
-            # Origin: N=0 by symmetry
-            push!(rows, 1); push!(cols, 1); push!(vals, 0.0)
-        elseif i == nr
-            # Boundary: N=0
-            push!(rows, i); push!(cols, i); push!(vals, 0.0)
-        else
-            # Interior: smoothly varying coefficient
-            # Use local "wavenumber" k ~ 1/(distance to origin)
-            # But regularized to avoid singularity
-            
-            r_i = r[i]
-            # Effective wavenumber with regularization
-            k_reg = 1.0 / sqrt(r_i^2 + δr^2)  # Regularized
-            
-            # Three-point stencil weighted by k_reg
-            coeff = 0.1 * k_reg  # Reduced strength for stability
-            
-            push!(rows, i); push!(cols, i-1); push!(vals, -coeff/(2*δr))
-            push!(rows, i); push!(cols, i); push!(vals, -0.05*k_reg)  # Damping
-            push!(rows, i); push!(cols, i+1); push!(vals, coeff/(2*δr))
-        end
+"메쉬(균일 r, 끝점 포함)에서 D2N 운영자 구성."
+function build_D2N(mesh)
+    nr, R = mesh.nr, mesh.R
+    r, dr = mesh.r, mesh.δr
+
+    Nm = nr - 1                   # r=R 노드는 J0(ζ_n)=0
+    ζ  = _j0_zeros(Nm)
+    k  = ζ ./ R
+
+    # B: J0(ζ_n r_i / R)
+    B = Matrix{Float64}(undef, nr, Nm)
+    @inbounds for i in 1:nr, n in 1:Nm
+        B[i,n] = besselj(0, ζ[n]*r[i]/R)
     end
-    
-    return sparse(rows, cols, vals, nr, nr)
+
+    # 축대칭 가중: r_i Δr (끝점 1/2)
+    w = r .* dr
+    w[1]  *= 0.5
+    w[end]*= 0.5
+    W = Diagonal(w)
+
+    # Gram & factor
+    G = Symmetric(B' * (W * B))
+    F = _factor_with_ridge(G)
+
+    return DirichletToNeumannOperator(B, W, k, F, ζ, R, r)
 end
 
-"""
-Constructor
-"""
-function DirichletToNeumannOperator(radial_mesh::RadialMesh; kwargs...)
-    N_matrix = build_N_chebyshev(radial_mesh)
-    cheb_pts = chebyshev_points(radial_mesh.nr-1, radial_mesh.R)
-    
-    return DirichletToNeumannOperator(radial_mesh, N_matrix, cheb_pts)
+"적용: Nφ = -B * ( (k .* (F  (B' * (W * φ)))) )"
+function apply_D2N(op::DirichletToNeumannOperator, φ::AbstractVector{<:Real})
+    @assert length(φ) == size(op.B,1) "apply_D2N: length(φ) must be nr"
+    rhs = op.B' * (op.W * φ)                 # Nm
+    a   = op.F \ rhs                          # Nm  (G^{-1} * rhs)
+    return - op.B * (op.k .* a)               # nr
 end
 
-"""
-Apply N operator
-"""
-function apply_N_operator(N_op::DirichletToNeumannOperator, φ::Vector{Float64})
-    return N_op.operator_matrix * φ
+"행렬이 꼭 필요할 때만 재료화(밀집 행렬)."
+function as_matrix(op::DirichletToNeumannOperator)
+    # X = G^{-1} Bᵀ W  (Nm×nr)
+    X = op.F \ (op.B' * op.W)
+    # N = - B Diag(k) X  (nr×nr)
+    return - op.B * (Diagonal(op.k) * X)
 end
+
+end # module
